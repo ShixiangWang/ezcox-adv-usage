@@ -1,0 +1,22 @@
+---
+title: "*ezcox*: an R Package for Cox Model Batch Processing and Visualization"
+subtitle: "An Use Case"
+author: "Shixiang Wang (SYSUCC)"
+date: "`r Sys.Date()`"
+output:
+  prettydoc::html_pretty:
+    theme: leonids
+---
+
+```{r setup, include=FALSE}
+if (capabilities("cairo"))
+    knitr::opts_chunk$set(dev.args = list(type = "cairo"),
+                          dpi = 300, tidy = "styler")
+```
+
+## Data preparation
+
+
+## Simple usage
+
+
