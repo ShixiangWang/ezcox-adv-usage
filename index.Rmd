@@ -11,12 +11,379 @@ output:
 ```{r setup, include=FALSE}
 if (capabilities("cairo"))
     knitr::opts_chunk$set(dev.args = list(type = "cairo"),
-                          dpi = 300, tidy = "styler")
+                          dpi = 300, tidy = "styler", collapse = TRUE)
 ```
 
+In this vignette, we would like to apply **ezcox** to a gene list containing oncogenes and
+tumor suppressors with TCGA datasets. All core features provided in **ezcox** will be
+presented. To focus on the presentation of **ezcox** features, we would only use
+mRNA expression data here. Without doubt, the features can be applied to any suitable
+variables, including:
+
+- mRNA expression
+- miRNA expression
+- transcript expression
+- protein expression
+- mutation status
+- methylation status
+- promoter activity
+- APOBEC activity
+- clinical features
+- ...
+
+All molecular profile data for public databases like TCGA can be obtained from [UCSC Xena](https://xenabrowser.net/datapages/) with
+[UCSCXenaTools](https://github.com/ropensci/UCSCXenaTools) or [UCSCXenaShiny](https://github.com/openbiox/UCSCXenaShiny).
+
+```{r}
+library(UCSCXenaTools)
+library(UCSCXenaShiny)
+library(ezcox)
+library(readr)
+library(dplyr)
+```
+
+
 ## Data preparation
+
+### Read gene list
+
+Firstly, we obtain driver gene list from [*IntOGen*](https://www.intogen.org/search) (referece: *A compendium of mutational cancer driver genes*).
+
+```{r}
+gene_table <- read_tsv("IntOGen-DriverGenes.tsv", col_types = cols())
+gene_list <- gene_table$Symbol
+```
+
+### Read gene expression
+
+Next, we obtain the gene expression data in TCGA.
+
+For just one gene, we can use the `query_pancan_value()` in `UCSCXenaShiny` package.
+
+```{r}
+expr <- query_pancan_value(gene_list[1])
+expr$expression[1:5]
+```
+
+For a few genes, `fetch_dense_values()` in `UCSCXenaTools` is more convenient.
+However, you need to previously confirm the UCSC Xena host and dataset ID
+(you can obtain this from [UCSC Xena](https://xenabrowser.net/datapages/) or `UCSCXenaShiny` Shiny interface).
+
+```{r eval=FALSE}
+host <- "https://toil.xenahubs.net"
+dataset <- "tcga_RSEM_gene_tpm"
+
+expr <- fetch_dense_values(host, dataset, gene_list, use_probeMap = TRUE)
+
+save(expr, file = "expr.RData")
+```
+
+```r
+-> Obtaining gene symbols...
+-> Checking identifiers...                                                                                                                             
+The following identifiers have been removed from host https://toil.xenahubs.net dataset tcga_RSEM_gene_tpm
+[1] "CNOT9" "NSD2" 
+-> Done.
+-> Checking samples...
+-> Done.
+-> Checking if the dataset has probeMap...
+-> Done. ProbeMap is found.
+-> Query done.
+```
+
+### Merge data
+
+Here, we merge TCGA clinical data, survival data, expression data with inner join.
+
+```{r}
+load("expr.RData")
+
+gene_list <- setdiff(gene_list, c("CNOT9", "NSD2"))
+
+df <- expr %>% 
+  t() %>%
+  as.data.frame() %>% 
+  tibble::rownames_to_column("sample") %>% 
+  as_tibble() %>% 
+  inner_join(tcga_surv, by = "sample") %>% 
+  inner_join(tcga_clinical, by = "sample") %>% 
+  rename(age = age_at_initial_pathologic_diagnosis)
+
+head(df)
+```
+
+### Scaling
+
+To obtain pretty HR value, here we scale gene expression to 1-5, so every 1
+increase in gene expression indicates 20% expression increase. As for HR, e.g.,
+`HR = 2` means hazard ratio would double when a gene expression per 20% increase. 
+
+```{r}
+scaling <- function(x, by = 0.2) {
+  y <- quantile(x, seq(0, 1, by)) # some variables may have same value for 10% 20% etc.
+  y <- y[!c(FALSE, diff(y) == 0)]
+  as.integer(cut(x, breaks = y, include.lowest = TRUE))
+}
+```
+
+
+```{r}
+df <- df %>% 
+  mutate_at(gene_list, scaling)
+```
 
 
 ## Simple usage
 
+In this section, we will show simple usage of **ezcox** by constructing single
+unvariable and multivariable Cox models.
+
+### Single unvariable model
+
+Here we simply construct a Cox model for overall survival (OS) only with `TP53`.
+
+```{r}
+rv <- ezcox(df, covariates = "TP53", time = "OS.time", status = "OS")
+rv
+```
+
+Useful information about the result model has been output as a `data.frame`.
+
+If you just want to show a forest plot for this model, you can use the following command.
+You only need to change the function name!
+
+```{r fig.width=7, fig.height=4}
+show_forest(df, covariates = "TP53", time = "OS.time", status = "OS")
+```
+
+To simplify, use:
+
+```{r fig.width=7, fig.height=3.5}
+show_forest(df, covariates = "TP53", time = "OS.time", status = "OS",
+            merge_models = TRUE, add_caption = FALSE)
+```
+
+The data shows when TP53 gene expression increases, the patient would have poor clinical outcome.
+
+Actually, you may want to obtain the model behind the plot, you can use the command to return
+model firstly:
+
+```{r}
+rv <- ezcox(df, covariates = "TP53", time = "OS.time", status = "OS", return_models = TRUE)
+rv
+```
+
+Then you can get it:
+
+```{r}
+get_models(rv)
+```
+
+### Single multivariable model
+
+It's very easy to construct a multivariable model by introducing another parameter
+`controls`. For example, if we want to explore the `TP53` expression with patients'
+age and clinical stage also taking into consideration.
+
+Let's clean the data firstly:
+
+```{r}
+df <- df %>% 
+  mutate(stage = case_when(
+    clinical_stage %in% c("I", "Stage I", "Stage IA1", "Stage IA2", "Stage IB", "Stage IB1", "Stage IB2", "Stage IC") ~ "I",
+    clinical_stage %in% c("IIa", "IIb", "Stage II", "Stage IIA", "Stage IIA1", "Stage IIA2", "Stage IIB", "Stage IIC") ~ "II",
+    clinical_stage %in% c("III", "Stage III", "Stage IIIA", "Stage IIIB", "Stage IIIC", "Stage IIIC1", "Stage IIIC2") ~ "III",
+    clinical_stage %in% c("IVa", "IVb", "Stage IV", "Stage IVA", "Stage IVB", "Stage IVC") ~ "IV",
+    TRUE ~ NA_character_
+  ),
+  stage = factor(stage, levels = c("I", "II", "III", "IV")))
+```
+
+
+```{r}
+rv <- ezcox(df, covariates = "TP53", controls = c("age", "stage"),
+              time = "OS.time", status = "OS", return_models = TRUE)
+rv
+```
+
+The code constructed a model as below:
+
+```{r}
+names(get_models(rv))
+```
+
+For single model, we can exchange the role of covariable and control variables,
+they are the same model. The key point is how what we want to explore and how we
+treat and explain the model.
+
+```r
+# If you passing the parameters below to ezcox() will return the same model
+covariates = "TP53", controls = c("age", "stage")
+covariates = "age", controls = c("TP53", "stage")
+covariates = "stage", controls = c("age", "TP53")
+```
+
+Still, let's show the result more clearly with forest plot:
+
+```{r fig.width=7, fig.height=6}
+show_forest(df, covariates = "TP53", controls = c("age", "stage"),
+            time = "OS.time", status = "OS", merge_models = TRUE,
+            show_global_p = "bottom", add_caption = FALSE)
+```
+
+Ooops! Why TP53 has no significant association with OS when the clinical features
+have been included?
+
+There are some reasons:
+
+1. The first reason we can read from the forest plots above. TP53 is not an
+independent variable, it has association with patient's age and clinical stages.
+You could explore this with correlation analysis and box plots.
+2. In the model above, we ignored a very strong factor, i.e., "cancer type".
+We already know that different tissues have different gene expression status.
+Actually, TP53 plays different roles in different cancer types. You can read some
+papers for more details.
+
+```{r, echo=FALSE, fig.cap="source: https://www.ncbi.nlm.nih.gov/pmc/articles/PMC5352183/"}
+knitr::include_graphics("https://www.ncbi.nlm.nih.gov/pmc/articles/PMC5352183/bin/oncotarget-08-624-g008.jpg")
+```
+
+## Batch processing
+
+Now, we are moving to the most powerful part of **ezcox**. Cox analysis is a
+common analysis technique to link variable to clinical outcome. In the omics era,
+Cox model batch processing is a basic strategy for screening clinical relevant variables,
+biomarker discovery and gene signature identification.
+However, all such analyses have been implemented with homebrew code in research community, thus lack of transparency
+and reproducibility. **ezcox** is born to address this issue for open science.
+
+In batch processing, we provide execution in either sequential or parallel ways.
+
+Considering only ~2,000 patients have stage status. The following code will only
+include age, cancer type, gender as control variables in the model construction,
+so most of the data (~10,000) can be utilized.
+
+### Sequential execution
+
+The only parameter we need to change is `covariates`, instead one variable, we pass
+a vector for batch processing.
+
+```{r message=FALSE}
+bt <- ezcox(df, covariates = gene_list, controls = c("age", "gender", "type"),
+            time = "OS.time", status = "OS",
+            keep_models = TRUE, return_models = FALSE)
+# don't return models if you have many models in processing
+```
+
+That's it. 
+
+```{r}
+DT::datatable(bt$res, caption = "Cox batch processing result for ~500 genes in TCGA dataset")
+```
+
+```{r}
+DT::datatable(bt$models, caption = "The models have been stored in local files")
+```
+
+To note, we did not directly store all models from the batch processing in the result object `bt`.
+Instead, we store the models to local file and link it to each covariates. On the
+one hand, we can store the modeling result for reproducible research and avoid repetitive calculation.
+On the other hand, we can filter model by simply filtering the data table `bt$res` and retrieve specific
+models we required for downstream analysis and visualization.
+
+### Parallel execution
+
+For parallel execution, we only need to change the function from `ezcox()` to
+`ezcox_parallel()`. At default, it would use multiple sessions to process the task.
+`batch_size` is used to set the workload of each session.
+
+```{r message=FALSE}
+bt2 <- ezcox_parallel(df, covariates = gene_list, controls = c("age", "gender", "type"),
+                      time = "OS.time", status = "OS",
+                      keep_models = TRUE, return_models = FALSE, batch_size = 50)
+```
+
+```{r}
+all.equal(bt$res, bt2$res)
+```
+
+### Visualization filtering
+
+There are so many variables, we can't visualize them in one forest plot. Next
+we need to filter the result before plotting.
+
+Firstly, we quickly filter out all controls.
+
+```{r}
+bt3 <- filter_ezcox(bt)
+```
+
+Sort the result by `p.value` and then show it with table.
+
+```{r}
+bt3$res <- bt3$res %>% arrange(p.value)
+DT::datatable(bt3$res, caption = "Core result from batch processing")
+```
+
+How many variables are statistical significant?
+
+```{r}
+bt3$res %>% 
+  filter(p.value < 0.05) %>% 
+  nrow()
+```
+
+That's so many. In practice, we generally limit the final gene number <10.
+So for illustration, here we just keep the top ten.
+
+```{r}
+mds <- get_models(bt3, variables = bt3$res$Variable[1:10])
+```
+
+Next visualize the top 2:
+
+```{r fig.width=7, fig.height=10}
+show_models(mds[1:2],
+            format_options= forestmodel::forest_model_format_options(point_size = 2))
+```
+The plot is very big, such figure is only suitable for one or two target variables.
+
+If we want to focus the gene list and include all of them in such a plot, how could
+we do that?
+
+```{r, fig.width=7, fig.height=6}
+show_models(
+  mds,
+  merge_models = TRUE,
+  drop_controls = TRUE
+)
+```
+
+## Group analysis
+
+In our research experience, sometimes we need to explore one variable with Cox in different
+groups. Here, for example, could be sex, stage, cancer types. By this approach, we
+don't need to adjust the group variable in Cox model any more, so we can focus on
+the variable importance in each subgroup.
+
+Take *KRAS* as an example, here we draw how it affect survival in different cancer
+types with `ezcox_group()`.
+
+```{r fig.width=7, fig.height=10}
+ezcox_group(df, grp_var = "type", covariate = "KRAS",
+            time = "OS.time", status = "OS",
+            format_options= forestmodel::forest_model_format_options(point_size = 2))
+```
+If you want to adjust other variables, that's same as we did above.
+
+```{r fig.width=7, fig.height=10}
+ezcox_group(df, grp_var = "type", 
+            covariate = "KRAS", controls = c("age", "gender"),
+            time = "OS.time", status = "OS",
+            format_options= forestmodel::forest_model_format_options(point_size = 2))
+```
+If you don't check the caption in the two forest plots above. They seems same!
+So **please note when you do such analysis, we recommend you add the caption
+and describe how you apply ezcox in figure legend and method part, otherwise
+it's very easy to misguide the readers**.
 
